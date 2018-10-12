@@ -485,11 +485,13 @@ function read(s::IOStream)
         if pos > 0
             sz -= pos
         end
-    catch
+    catch err
+        err isa IOError || rethrow(err)
     end
     b = StringVector(sz<=0 ? 1024 : sz)
     nr = readbytes_all!(s, b, typemax(Int))
     resize!(b, nr)
+    return b
 end
 
 """
@@ -506,6 +508,7 @@ function read(s::IOStream, nb::Integer; all::Bool=true)
     b = Vector{UInt8}(undef, nb)
     nr = readbytes!(s, b, nb, all=all)
     resize!(b, nr)
+    return b
 end
 
 ## peek ##

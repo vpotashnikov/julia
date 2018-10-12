@@ -44,16 +44,17 @@ function challenge_prompt(cmd::Cmd, challenges; timeout::Integer=60, debug::Bool
         !debug && return ""
         str = read(seekstart(output), String)
         isempty(str) && return ""
-        "Process output found:\n\"\"\"\n$str\n\"\"\""
+        return "Process output found:\n\"\"\"\n$str\n\"\"\""
     end
     out = IOBuffer()
     with_fake_pty() do slave, master
         p = run(detach(cmd), slave, slave, slave, wait=false)
+        Base.close_pipe_sync(slave)
 
         # Kill the process if it takes too long. Typically occurs when process is waiting
         # for input.
         timer = Channel{Symbol}(1)
-        @async begin
+        watcher = @async begin
             waited = 0
             while waited < timeout && process_running(p)
                 sleep(1)
@@ -74,8 +75,6 @@ function challenge_prompt(cmd::Cmd, challenges; timeout::Integer=60, debug::Bool
                 sleep(3)
                 process_running(p) && kill(p, Base.SIGKILL)
             end
-
-            close(master)
         end
 
         for (challenge, response) in challenges
@@ -87,12 +86,17 @@ function challenge_prompt(cmd::Cmd, challenges; timeout::Integer=60, debug::Bool
             write(master, response)
         end
 
-        # Capture output from process until `master` is closed
-        while !eof(master)
-            write(out, readavailable(master))
+        # Capture output from process until `slave` is closed
+        try
+            write(out, master)
+        catch ex
+            if !(ex isa Base.IOError && ex.code == Base.UV_EIO)
+                rethrow(ex) # ignore EIO from master after slave dies
+            end
         end
 
         status = fetch(timer)
+        close(master)
         if status != :success
             if status == :timeout
                 error("Process timed out possibly waiting for a response. ",
@@ -101,6 +105,7 @@ function challenge_prompt(cmd::Cmd, challenges; timeout::Integer=60, debug::Bool
                 error("Failed process. ", format_output(out), "\n", p)
             end
         end
+        wait(watcher)
     end
     nothing
 end

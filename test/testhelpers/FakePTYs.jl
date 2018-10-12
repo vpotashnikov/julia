@@ -10,7 +10,7 @@ function open_fake_pty()
     O_RDWR = Base.Filesystem.JL_O_RDWR
     O_NOCTTY = Base.Filesystem.JL_O_NOCTTY
 
-    fdm = ccall(:posix_openpt, Cint, (Cint,), O_RDWR|O_NOCTTY)
+    fdm = ccall(:posix_openpt, Cint, (Cint,), O_RDWR | O_NOCTTY)
     fdm == -1 && error("Failed to open PTY master")
     rc = ccall(:grantpt, Cint, (Cint,), fdm)
     rc != 0 && error("grantpt failed")
@@ -18,12 +18,13 @@ function open_fake_pty()
     rc != 0 && error("unlockpt")
 
     fds = ccall(:open, Cint, (Ptr{UInt8}, Cint),
-        ccall(:ptsname, Ptr{UInt8}, (Cint,), fdm), O_RDWR|O_NOCTTY)
+        ccall(:ptsname, Ptr{UInt8}, (Cint,), fdm), O_RDWR | O_NOCTTY)
 
-    # slave
     slave = RawFD(fds)
+    # slave = fdio(fds, true)
+    # slave = Base.Filesystem.File(RawFD(fds))
     master = Base.TTY(RawFD(fdm); readable = true)
-    slave, master
+    return slave, master
 end
 
 function with_fake_pty(f)
@@ -31,9 +32,9 @@ function with_fake_pty(f)
     try
         f(slave, master)
     finally
-        ccall(:close,Cint,(Cint,),slave) # XXX: this causes the kernel to throw away all unread data on the pty
         close(master)
     end
+    nothing
 end
 
 end
