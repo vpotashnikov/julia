@@ -909,6 +909,10 @@ end
         J1, J2 = @inferred(promote(I1, I2))
         @test J1 === J2
     end
+
+    i = CartesianIndex(17,-2)
+    @test CR .+ i === i .+ CR === CartesianIndices((19:21, -1:3))
+    @test CR .- i === CartesianIndices((-15:-13, 3:7))
 end
 
 @testset "issue #25770" begin

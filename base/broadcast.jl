@@ -1042,6 +1042,14 @@ broadcasted(::DefaultArrayStyle{1}, ::typeof(big), r::StepRange) = big(r.start):
 broadcasted(::DefaultArrayStyle{1}, ::typeof(big), r::StepRangeLen) = StepRangeLen(big(r.ref), big(r.step), length(r), r.offset)
 broadcasted(::DefaultArrayStyle{1}, ::typeof(big), r::LinRange) = LinRange(big(r.start), big(r.stop), length(r))
 
+## CartesianIndices
+broadcasted(::typeof(+), I::CartesianIndices{N}, j::CartesianIndex{N}) where N =
+    CartesianIndices(map((rng, offset)->rng .+ offset, I.indices, Tuple(j)))
+broadcasted(::typeof(+), j::CartesianIndex{N}, I::CartesianIndices{N}) where N =
+    I .+ j
+broadcasted(::typeof(-), I::CartesianIndices{N}, j::CartesianIndex{N}) where N =
+    CartesianIndices(map((rng, offset)->rng .- offset, I.indices, Tuple(j)))
+
 ## In specific instances, we can broadcast masked BitArrays whole chunks at a time
 # Very intentionally do not support much functionality here: scalar indexing would be O(n)
 struct BitMaskedBitArray{N,M}
