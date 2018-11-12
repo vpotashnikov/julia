@@ -57,15 +57,9 @@ out = read(`$echocmd hello` & `$echocmd world`, String)
 # Test for SIGPIPE being treated as normal termination (throws an error if broken)
 Sys.isunix() && run(pipeline(yescmd, `head`, devnull))
 
-let a, p
-    a = Base.Condition()
-    t = @async begin
-        p = run(pipeline(yescmd,devnull), wait=false)
-        Base.notify(a,p)
-        @test !success(p)
-    end
-    p = wait(a)
-    kill(p)
+let p = run(pipeline(yescmd, devnull), wait=false)
+    t = @async kill(p)
+    @test !success(p)
     wait(t)
 end
 
@@ -170,16 +164,19 @@ let r, t
     t = @async begin
         try
             wait(r)
-        catch
+            @test false
+        catch ex
+            @test isa(ex, InterruptException)
         end
-        p = run(`$sleepcmd 1`, wait=false); wait(p)
+        p = run(`$sleepcmd 1`, wait=false)
+        wait(p)
         @test p.exitcode == 0
         return true
     end
     yield()
     schedule(t, InterruptException(), error=true)
     yield()
-    put!(r,11)
+    put!(r, 11)
     yield()
     @test fetch(t)
 end

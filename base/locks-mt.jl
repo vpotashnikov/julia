@@ -1,23 +1,18 @@
 # This file is a part of Julia. License is MIT: https://julialang.org/license
 
 import .Base: _uv_hook_close, unsafe_convert,
-    lock, trylock, unlock, islocked, wait, notify
+    lock, trylock, unlock, islocked, wait, notify,
+    AbstractLock, GenericCondition, GenericReentrantLock, GenericEvent
 
-export SpinLock, RecursiveSpinLock, Mutex, Event
+export ConditionMT, EventMT, ReentrantLockMT
 
+# Important Note: these low-level primitives exported here
+#   are typically not for general usage
+export SpinLock, RecursiveSpinLock, Mutex
 
 ##########################################
 # Atomic Locks
 ##########################################
-
-"""
-    AbstractLock
-
-Abstract supertype describing types that
-implement the thread-safe synchronization primitives:
-[`lock`](@ref), [`trylock`](@ref), [`unlock`](@ref), and [`islocked`](@ref).
-"""
-abstract type AbstractLock end
 
 # Test-and-test-and-set spin locks are quickest up to about 30ish
 # contending threads. If you have more contention than that, perhaps
@@ -107,6 +102,7 @@ may be held for a considerable length of time.
 """
 const RecursiveSpinLock = RecursiveTatasLock
 
+
 function lock(l::RecursiveTatasLock)
     if l.ownertid[] == threadid()
         l.handle[] += 1
@@ -141,8 +137,8 @@ function trylock(l::RecursiveTatasLock)
 end
 
 function unlock(l::RecursiveTatasLock)
-    @assert(l.ownertid[] == threadid(), "unlock from wrong thread")
-    @assert(l.handle[] != 0, "unlock count must match lock count")
+    l.ownertid[] == threadid() || error("unlock from wrong thread")
+    l.handle[] != 0 || error("unlock count must match lock count")
     if l.handle[] == 1
         l.ownertid[] = 0
         l.handle[] = 0
@@ -162,13 +158,7 @@ end
 # System Mutexes
 ##########################################
 
-# These are mutexes from libuv. We're doing some error checking (and
-# paying for it in overhead), but regardless, in some situations,
-# passing a bad parameter will cause an abort.
-
-# TODO: how defensive to get, and how to turn it off?
-# TODO: how to catch an abort?
-
+# These are mutexes from libuv.
 const UV_MUTEX_SIZE = ccall(:jl_sizeof_uv_mutex, Cint, ())
 
 """
@@ -229,7 +219,7 @@ function trylock(m::Mutex)
 end
 
 function unlock(m::Mutex)
-    @assert(m.ownertid == threadid(), "unlock from wrong thread")
+    m.ownertid == threadid() || error("unlock from wrong thread")
     m.ownertid = 0
     ccall(:uv_mutex_unlock, Cvoid, (Ptr{Cvoid},), m)
     return
@@ -240,55 +230,22 @@ function islocked(m::Mutex)
 end
 
 """
-    Event()
+    ReentrantLockMT()
 
-Create a level-triggered event source. Tasks that call [`wait`](@ref) on an
-`Event` are suspended and queued until `notify` is called on the `Event`.
-After `notify` is called, the `Event` remains in a signaled state and
-tasks will no longer block when waiting for it.
+A thread-safe version of [`ReentrantLock`](@ref).
 """
-mutable struct Event
-    lock::Mutex
-    q::Vector{Task}
-    set::Bool
-    # TODO: use a Condition with its paired lock
-    Event() = new(Mutex(), Task[], false)
-end
+const ReentrantLockMT = GenericReentrantLock{TatasLock}
 
-function wait(e::Event)
-    e.set && return
-    lock(e.lock)
-    while !e.set
-        ct = current_task()
-        push!(e.q, ct)
-        unlock(e.lock)
-        try
-            wait()
-        catch
-            filter!(x->x!==ct, e.q)
-            rethrow()
-        end
-        lock(e.lock)
-    end
-    unlock(e.lock)
-    return nothing
-end
+"""
+    ConditionMT([lock-mt])
 
-function notify(e::Event)
-    lock(e.lock)
-    if !e.set
-        e.set = true
-        for t in e.q
-            schedule(t)
-        end
-        empty!(e.q)
-    end
-    unlock(e.lock)
-    return nothing
-end
+A thread-safe version of [`Condition`](@ref).
+"""
+const ConditionMT = GenericCondition{ReentrantLockMT}
 
-# TODO: decide what to call this
-#function clear(e::Event)
-#    e.set = false
-#    return nothing
-#end
+"""
+    EventMT()
+
+A thread-safe version of [`Event`](@ref).
+"""
+const EventMT = GenericEvent{ReentrantLockMT}

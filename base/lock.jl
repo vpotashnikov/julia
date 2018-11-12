@@ -4,19 +4,23 @@
 """
     ReentrantLock()
 
-Creates a reentrant lock for synchronizing [`Task`](@ref)s.
+Creates a re-entrant lock for synchronizing [`Task`](@ref)s.
 The same task can acquire the lock as many times as required.
 Each [`lock`](@ref) must be matched with an [`unlock`](@ref).
 
-This lock is NOT threadsafe. See [`Threads.Mutex`](@ref) for a threadsafe lock.
+This lock is NOT thread-safe. See [`Threads.ReentrantLockMT`](@ref) for a thread-safe version.
 """
-mutable struct ReentrantLock
+mutable struct GenericReentrantLock{ThreadLock<:AbstractLock} <: AbstractLock
     locked_by::Union{Task, Nothing}
-    cond_wait::Condition
+    cond_wait::GenericCondition{ThreadLock}
     reentrancy_cnt::Int
 
-    ReentrantLock() = new(nothing, Condition(), 0)
+    GenericReentrantLock{ThreadLock}() where {ThreadLock<:AbstractLock} = new(nothing, GenericCondition{ThreadLock}(), 0)
 end
+
+# A basic single-threaded, Julia-aware lock:
+const ReentrantLock = GenericReentrantLock{CooperativeLock}
+
 
 """
     islocked(lock) -> Status (Boolean)
@@ -24,7 +28,7 @@ end
 Check whether the `lock` is held by any task/thread.
 This should not be used for synchronization (see instead [`trylock`](@ref)).
 """
-function islocked(rl::ReentrantLock)
+function islocked(rl::GenericReentrantLock)
     return rl.reentrancy_cnt != 0
 end
 
@@ -38,17 +42,22 @@ return `false`.
 
 Each successful `trylock` must be matched by an [`unlock`](@ref).
 """
-function trylock(rl::ReentrantLock)
+function trylock(rl::GenericReentrantLock)
     t = current_task()
-    if rl.reentrancy_cnt == 0
-        rl.locked_by = t
-        rl.reentrancy_cnt = 1
-        return true
-    elseif t == notnothing(rl.locked_by)
-        rl.reentrancy_cnt += 1
-        return true
+    lock(rl.cond_wait)
+    try
+        if rl.reentrancy_cnt == 0
+            rl.locked_by = t
+            rl.reentrancy_cnt = 1
+            return true
+        elseif t == notnothing(rl.locked_by)
+            rl.reentrancy_cnt += 1
+            return true
+        end
+        return false
+    finally
+        unlock(rl.cond_wait)
     end
-    return false
 end
 
 """
@@ -60,18 +69,23 @@ wait for it to become available.
 
 Each `lock` must be matched by an [`unlock`](@ref).
 """
-function lock(rl::ReentrantLock)
+function lock(rl::GenericReentrantLock)
     t = current_task()
-    while true
-        if rl.reentrancy_cnt == 0
-            rl.locked_by = t
-            rl.reentrancy_cnt = 1
-            return
-        elseif t == notnothing(rl.locked_by)
-            rl.reentrancy_cnt += 1
-            return
+    lock(rl.cond_wait)
+    try
+        while true
+            if rl.reentrancy_cnt == 0
+                rl.locked_by = t
+                rl.reentrancy_cnt = 1
+                return
+            elseif t == notnothing(rl.locked_by)
+                rl.reentrancy_cnt += 1
+                return
+            end
+            wait(rl.cond_wait)
         end
-        wait(rl.cond_wait)
+    finally
+        unlock(rl.cond_wait)
     end
 end
 
@@ -83,19 +97,24 @@ Releases ownership of the `lock`.
 If this is a recursive lock which has been acquired before, decrement an
 internal counter and return immediately.
 """
-function unlock(rl::ReentrantLock)
-    if rl.reentrancy_cnt == 0
-        error("unlock count must match lock count")
-    end
-    rl.reentrancy_cnt -= 1
-    if rl.reentrancy_cnt == 0
-        rl.locked_by = nothing
-        notify(rl.cond_wait)
+function unlock(rl::GenericReentrantLock)
+    t = current_task()
+    rl.reentrancy_cnt == 0 && error("unlock count must match lock count")
+    rl.locked_by == t || error("unlock from wrong thread")
+    lock(rl.cond_wait)
+    try
+        rl.reentrancy_cnt -= 1
+        if rl.reentrancy_cnt == 0
+            rl.locked_by = nothing
+            notify(rl.cond_wait)
+        end
+    finally
+        unlock(rl.cond_wait)
     end
     return
 end
 
-function lock(f, l)
+function lock(f, l::AbstractLock)
     lock(l)
     try
         return f()
@@ -104,7 +123,7 @@ function lock(f, l)
     end
 end
 
-function trylock(f, l)
+function trylock(f, l::AbstractLock)
     if trylock(l)
         try
             return f()
@@ -159,4 +178,5 @@ function release(s::Semaphore)
     @assert s.curr_cnt > 0 "release count must match acquire count"
     s.curr_cnt -= 1
     notify(s.cond_wait; all=false)
+    return
 end

@@ -1,22 +1,84 @@
 # This file is a part of Julia. License is MIT: https://julialang.org/license
 
+## thread/task locking abstraction
+
+"""
+    AbstractLock
+
+Abstract supertype describing types that
+implement the thread-safe synchronization primitives:
+[`lock`](@ref), [`trylock`](@ref), [`unlock`](@ref), and [`islocked`](@ref).
+"""
+abstract type AbstractLock end
+
+"""
+    NotALock
+
+A struct that pretends to be always locked on the original thread it was allocated on,
+and simply ignores all other interactions.
+This can be used in the place of a real lock to, instead, simply and cheaply assert
+that the operation is only occurring on a single thread.
+And is thus functionally equivalent to allocating a real, recursive lock,
+immediately calling `lock` on it, and then never calling a matching `unlock`,
+except that calling `lock` from another thread will throw a concurrency violation exception.
+"""
+struct NotALock <: AbstractLock
+    ownertid::Int16
+    NotALock() = new(Threads.threadid())
+end
+assert_havelock(l::NotALock) = assert_havelock(l, l.ownertid)
+lock(l::NotALock) = (l.ownertid == Threads.threadid() ? nothing : error("concurrency violation detected"))
+unlock(l::NotALock) = assert_havelock(l)
+trylock(l::NotALock) = l.ownertid == Threads.threadid()
+islocked(::NotALock) = true
+
+"""
+    CooperativeLock
+
+An optimistic lock, which can be used cheaply to check for missing
+lock/unlock guards around `wait`, in the trivial (conflict-free, yield-free, single-threaded, non-recursive) case.
+"""
+mutable struct CooperativeLock <: AbstractLock
+    owner::Union{Task, Nothing}
+    CooperativeLock() = new(nothing)
+end
+assert_havelock(l::CooperativeLock) = l.owner === current_task() ? nothing : error("concurrency violation detected")
+lock(l::CooperativeLock) = (l.owner === nothing || error("concurrency violation detected"); l.owner = current_task(); nothing)
+unlock(l::CooperativeLock) = (assert_havelock(l); l.owner = nothing; nothing)
+trylock(l::CooperativeLock) = (l.owner === nothing ? (l.owner = current_task(); true) : false)
+islocked(::CooperativeLock) = l.owner === nothing
+
+
 ## condition variables
 
 """
-    Condition()
+    Condition([lock])
 
 Create an edge-triggered event source that tasks can wait for. Tasks that call [`wait`](@ref) on a
 `Condition` are suspended and queued. Tasks are woken up when [`notify`](@ref) is later called on
 the `Condition`. Edge triggering means that only tasks waiting at the time [`notify`](@ref) is
 called can be woken up. For level-triggered notifications, you must keep extra state to keep
-track of whether a notification has happened. The [`Channel`](@ref) type does
-this, and so can be used for level-triggered events.
-"""
-mutable struct Condition
-    waitq::Vector{Any}
+track of whether a notification has happened. The [`Channel`](@ref) and [`Event`](@ref) types do
+this, and can be used for level-triggered events.
 
-    Condition() = new([])
+This object is NOT thread-safe. See [`Threads.ConditionMT`](@ref) for a thread-safe version.
+"""
+mutable struct GenericCondition{L<:AbstractLock}
+    waitq::Vector{Any}
+    lock::L
+
+    GenericCondition{L}() where {L<:AbstractLock} = new{L}([], L())
+    GenericCondition{L}(l::L) where {L<:AbstractLock} = new{L}([], l)
+    GenericCondition(l::AbstractLock) = new{typeof(l)}([], l)
 end
+
+assert_havelock(l::AbstractLock, tid=Threads.threadid()) = (islocked(l) && tid == Threads.threadid()) ? nothing : error("concurrency violation detected")
+assert_havelock(c::GenericCondition) = assert_havelock(c.lock)
+
+lock(c::GenericCondition) = lock(c.lock)
+unlock(c::GenericCondition) = unlock(c.lock)
+trylock(c::GenericCondition) = trylock(c.lock)
+islocked(c::GenericCondition) = islocked(c.lock)
 
 """
     wait([x])
@@ -37,16 +99,19 @@ restarted by an explicit call to [`schedule`](@ref) or [`yieldto`](@ref).
 Often `wait` is called within a `while` loop to ensure a waited-for condition is met before
 proceeding.
 """
-function wait(c::Condition)
+function wait(c::GenericCondition)
     ct = current_task()
-
+    assert_havelock(c)
     push!(c.waitq, ct)
+    unlock(c) # TODO: should this be `lockcount = unlock_all(c); ...; relock(c, lockcount)`
 
     try
         return wait()
     catch
         filter!(x->x!==ct, c.waitq)
         rethrow()
+    finally
+        lock(c)
     end
 end
 
@@ -59,8 +124,9 @@ is raised as an exception in the woken tasks.
 
 Return the count of tasks woken up. Return 0 if no tasks are waiting on `condition`.
 """
-notify(c::Condition, @nospecialize(arg = nothing); all=true, error=false) = notify(c, arg, all, error)
-function notify(c::Condition, arg, all, error)
+notify(c::GenericCondition, @nospecialize(arg = nothing); all=true, error=false) = notify(c, arg, all, error)
+function notify(c::GenericCondition, @nospecialize(arg), all, error)
+    assert_havelock(c)
     cnt = 0
     if all
         cnt = length(c.waitq)
@@ -76,9 +142,62 @@ function notify(c::Condition, arg, all, error)
     cnt
 end
 
-notify_error(c::Condition, err) = notify(c, err, true, true)
+notify_error(c::GenericCondition, err) = notify(c, err, true, true)
 
-n_waiters(c::Condition) = length(c.waitq)
+n_waiters(c::GenericCondition) = length(c.waitq)
+
+"""
+    isempty(condition)
+
+Return `true` if no tasks are waiting on the condition, `false` otherwise.
+"""
+isempty(c::GenericCondition) = isempty(c.waitq)
+
+
+"""
+    Event()
+
+Create a level-triggered event source. Tasks that call [`wait`](@ref) on an
+`Event` are suspended and queued until `notify` is called on the `Event`.
+After `notify` is called, the `Event` remains in a signaled state and
+tasks will no longer block when waiting for it.
+"""
+mutable struct GenericEvent{L<:AbstractLock}
+    notify::GenericCondition{L}
+    set::Bool
+    GenericEvent{L}() where {L<:AbstractLock} = new{L}(GenericCondition{L}(), false)
+end
+
+function wait(e::GenericEvent)
+    e.set && return
+    lock(e.notify)
+    try
+        while !e.set
+            wait(e.notify)
+        end
+    finally
+        unlock(e.notify)
+    end
+    nothing
+end
+
+function notify(e::GenericEvent)
+    lock(e.notify)
+    try
+        if !e.set
+            e.set = true
+            notify(e.notify)
+        end
+    finally
+        unlock(e.notify)
+    end
+    nothing
+end
+
+
+const Condition = GenericCondition{NotALock}
+const Event = GenericEvent{NotALock}
+
 
 ## scheduler and work queue
 
